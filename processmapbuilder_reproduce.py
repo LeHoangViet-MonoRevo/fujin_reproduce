@@ -5,7 +5,7 @@ from typing import List
 
 from google.protobuf.json_format import ParseDict
 
-import constants
+from constants import constants
 
 warnings.simplefilter(action="ignore", category=Warning)
 
@@ -55,6 +55,7 @@ class ProcessMapBuilder:
         return list_process_id
 
     def build_process_graph_root(self) -> List:
+        # This one is the core function of this class
         process_graph = []
         layer = 1
 

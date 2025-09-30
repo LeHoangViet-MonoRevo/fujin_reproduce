@@ -1611,6 +1611,627 @@ class TimeComputation:
         return False
 
 
+class TimeComputationExtention(TimeComputation):
+    def resource_filter_linker(
+        self,
+        process_unit,
+        dict_force_start,
+        time_grouper,
+        time_grouper_machine,
+        deadline=None,
+    ):
+        schedule_predict_step_dict = defaultdict(lambda: defaultdict(list))
+        schedule_predict_saver_dict = defaultdict(dict)
+        list_valid_ids = []
+        list_final_ids = []
+        step = constants.PRE_PROCESS_STEP
+        p_time = process_unit["timing_details"][step]
+        list_final_ids_tmp = []
+        for id, start_process in dict_force_start.items():
+            worker_id, machine_id, _ = map(lambda x: int(float(x)), id.split("___"))
+            is_auto = self.factory_rs_info["dict_machine_auto"].get(machine_id, False)
+            allocated_time_list_tmp, exceed_end_max = self.generate_working_intervals(
+                start_dt=start_process,
+                min_total_minutes=p_time,
+                is_work_break_time=process_unit["is_work_break_time"],
+                deadline=deadline,
+            )
+            if exceed_end_max:
+                list_final_ids_tmp.append(id)
+            schedule_predict_step_dict[step][id].append(allocated_time_list_tmp)
+            schedule_predict_saver_dict[id][step] = allocated_time_list_tmp
+        _, per_group_verdict = self.validate_queries_inside_availability(
+            time_grouper_qr=schedule_predict_step_dict[step],
+            time_grouper=time_grouper,
+            deadline=deadline,
+            auto=False,
+        )
+        per_group_verdict = per_group_verdict.filter(
+            pl.col("all_queries_contained")
+        ).with_columns(
+            (pl.col("id") + "___" + pl.col("group").cast(pl.Utf8)).alias("id_group")
+        )
+        list_valid_ids.extend(per_group_verdict["id_group"].to_list())
+        list_final_ids.extend(list(set(list_valid_ids) & set(list_final_ids_tmp)))
+        list_valid_ids = list(set(list_valid_ids) - set(list_final_ids))
+        for step, p_time in process_unit["timing_details"].items():
+            if step == constants.PRE_PROCESS_STEP:
+                continue
+            list_final_ids_tmp = []
+            for id in list_valid_ids:
+                _, machine_id, _ = map(lambda x: int(float(x)), id.split("___"))
+                is_auto = self.factory_rs_info["dict_machine_auto"].get(
+                    machine_id, False
+                )
+                current_end = schedule_predict_saver_dict[id][
+                    constants.PREVIOUS_PROCESS_STEP[step]
+                ][-1][-1]
+                if (
+                    process_unit["is_nightshift_expected"]
+                    and step == constants.PROCESSING_STEP
+                ):
+                    if not process_unit["is_work_break_time"]:
+                        allocated_time_list_tmp, exceed_end_max = (
+                            self.allocate_processing_time_with_breaks(
+                                start=current_end,
+                                processing_minutes=p_time,
+                                deadline=deadline,
+                            )
+                        )
+                    else:
+                        exceed_end_max = False
+                        end_mid_process = current_end + timedelta(minutes=p_time)
+                        if deadline and current_end <= deadline <= end_mid_process:
+                            allocated_time_list_tmp = [(current_end, deadline)]
+                            exceed_end_max = True
+                        else:
+                            allocated_time_list_tmp = [(current_end, end_mid_process)]
+                    if process_unit["timing_details"][constants.POST_PROCESS_STEP] > 0:
+                        end_mid_process = self.shift_end_to_next_holiday(
+                            allocated_time_list_tmp[-1][-1],
+                            process_unit["is_work_break_time"],
+                        )
+                        if (
+                            deadline
+                            and allocated_time_list_tmp[-1][0]
+                            <= deadline
+                            <= end_mid_process
+                        ):
+                            allocated_time_list_tmp[-1] = (
+                                allocated_time_list_tmp[-1][0],
+                                deadline,
+                            )
+                            exceed_end_max = True
+                        else:
+                            allocated_time_list_tmp[-1] = (
+                                allocated_time_list_tmp[-1][0],
+                                end_mid_process,
+                            )
+                else:
+                    allocated_time_list_tmp, exceed_end_max = (
+                        self.generate_working_intervals(
+                            start_dt=current_end,
+                            min_total_minutes=p_time,
+                            is_work_break_time=process_unit["is_work_break_time"],
+                            deadline=deadline,
+                        )
+                    )
+                if exceed_end_max:
+                    list_final_ids_tmp.append(id)
+                step_auto = (
+                    "processing_auto"
+                    if is_auto and step == constants.PROCESSING_STEP
+                    else step
+                )
+                schedule_predict_step_dict[step_auto][f"{id}"].append(
+                    allocated_time_list_tmp
+                )
+                schedule_predict_saver_dict[f"{id}"][step] = allocated_time_list_tmp
+            list_valid_ids = []
+            if (
+                step == constants.PROCESSING_STEP
+                and schedule_predict_step_dict["processing_auto"]
+            ):
+                time_grouper_machine = self.avail_time_grouper(time_grouper_machine)
+                time_grouper_local = time_grouper_machine
+                if process_unit["is_nightshift_expected"]:
+                    time_grouper_local = self.nightshift_timegrouper_convert(
+                        time_grouper_machine
+                    )
+                _, per_group_verdict = self.validate_queries_inside_availability(
+                    time_grouper_qr=schedule_predict_step_dict["processing_auto"],
+                    time_grouper=time_grouper_local,
+                    deadline=deadline,
+                    auto=True,
+                )
+                per_group_verdict = per_group_verdict.filter(
+                    pl.col("all_queries_contained")
+                ).with_columns(
+                    (pl.col("id") + "___" + pl.col("group").cast(pl.Utf8)).alias(
+                        "id_group"
+                    )
+                )
+                list_valid_ids.extend(per_group_verdict["id_group"].to_list())
+            if schedule_predict_step_dict[step]:
+                time_grouper_local = time_grouper
+                if step == constants.PROCESSING_STEP:
+                    if process_unit["is_nightshift_expected"]:
+                        time_grouper_local = self.nightshift_timegrouper_convert(
+                            time_grouper
+                        )
+                _, per_group_verdict = self.validate_queries_inside_availability(
+                    time_grouper_qr=schedule_predict_step_dict[step],
+                    time_grouper=time_grouper_local,
+                    deadline=deadline,
+                    auto=False,
+                )
+                per_group_verdict = per_group_verdict.filter(
+                    pl.col("all_queries_contained")
+                ).with_columns(
+                    (pl.col("id") + "___" + pl.col("group").cast(pl.Utf8)).alias(
+                        "id_group"
+                    )
+                )
+                list_valid_ids.extend(per_group_verdict["id_group"].to_list())
+            list_final_ids.extend(list(set(list_valid_ids) & set(list_final_ids_tmp)))
+            list_valid_ids = list(set(list_valid_ids) - set(list_final_ids_tmp))
+        return list_valid_ids + list_final_ids, schedule_predict_step_dict
+
+    def build_enough_time_list_unmanned_process_nightshift_priority_linker(
+        self,
+        process_unit,
+        time_grouper,
+        time_grouper_machine,
+        total_allocated_time,
+        overtime,
+    ):
+        decision_dict = {}
+        dict_operating_rate_worker = {}
+        dict_operating_rate_machine = {}
+        list_valid_ids, _ = self.resource_filter(
+            process_unit, time_grouper, time_grouper_machine
+        )
+        for id, ts_list in time_grouper.items():
+            worker_id = int(float(id.split("___")[0]))
+            process_id = int(float(id.split("___")[1]))
+            ts_list_machine = time_grouper_machine[process_id]
+            allocated_time_dict = defaultdict(list)
+            operating_rate_worker = dict_operating_rate_worker.setdefault(
+                worker_id,
+                self.get_operating_rate(
+                    rs_id=worker_id,
+                    total_allocated_time=total_allocated_time,
+                    type="worker",
+                ),
+            )
+            operating_rate_machine = dict_operating_rate_machine.setdefault(
+                process_id,
+                self.get_operating_rate(
+                    rs_id=process_id,
+                    total_allocated_time=total_allocated_time,
+                    type="machine",
+                ),
+            )
+            for index in range(len(ts_list)):
+                if f"{id}___{index}" not in list_valid_ids:
+                    continue
+                previous_processing_time = process_unit["timing_details"][
+                    constants.PRE_PROCESS_STEP
+                ]
+                mid_processing_time = process_unit["timing_details"][
+                    constants.PROCESSING_STEP
+                ]
+                post_processing_time = process_unit["timing_details"][
+                    constants.POST_PROCESS_STEP
+                ]
+                grouped_time = ts_list[index]
+                if not len(grouped_time):
+                    continue
+                grouped_time_df = pd.DataFrame(
+                    data=grouped_time, columns=["start", "end"]
+                )
+                grouped_time_df["diff"] = (
+                    grouped_time_df["end"] - grouped_time_df["start"]
+                )
+                grouped_time_df["cumsum"] = grouped_time_df["diff"].cumsum()
+
+                grouped_time_df = grouped_time_df[
+                    (
+                        grouped_time_df["cumsum"]
+                        >= timedelta(minutes=previous_processing_time)
+                    )
+                    & (grouped_time_df["end"].dt.hour >= self.WORKING_HOURS_END.hour)
+                ]
+                if grouped_time_df.empty:
+                    continue
+                available_pre_process = grouped_time[: (grouped_time_df.index[0] + 1)]
+                if previous_processing_time > 0:
+                    while previous_processing_time > 0 and available_pre_process:
+                        start_time, end_time = available_pre_process[-1]
+                        time_difference = (end_time - start_time).total_seconds() / 60
+                        if time_difference >= previous_processing_time:
+                            start_pre_process = end_time - timedelta(
+                                minutes=previous_processing_time
+                            )
+                            previous_processing_time = 0
+                            allocated_time_dict[constants.PRE_PROCESS_STEP].append(
+                                (start_pre_process, end_time)
+                            )
+                            if start_pre_process == start_time:
+                                available_pre_process.pop(-1)
+                        else:
+                            allocated_time_dict[constants.PRE_PROCESS_STEP].append(
+                                available_pre_process.pop(-1)
+                            )
+                            previous_processing_time -= time_difference
+                else:
+                    allocated_time_dict[constants.PRE_PROCESS_STEP] = [
+                        (available_pre_process[-1][-1], available_pre_process[-1][-1])
+                    ]
+                allocated_time_dict[constants.PRE_PROCESS_STEP] = list(
+                    reversed(allocated_time_dict[constants.PRE_PROCESS_STEP])
+                )
+
+                is_mid_process_not_suitable = False
+                if mid_processing_time > 0:
+                    end_mid_process = allocated_time_dict[constants.PRE_PROCESS_STEP][
+                        -1
+                    ][-1] + timedelta(minutes=mid_processing_time)
+                    allocated_time_dict[constants.PROCESSING_STEP] = [
+                        (
+                            allocated_time_dict[constants.PRE_PROCESS_STEP][-1][-1],
+                            end_mid_process,
+                        )
+                    ]
+                else:
+                    allocated_time_dict[constants.PROCESSING_STEP] = [
+                        (
+                            allocated_time_dict[constants.PRE_PROCESS_STEP][-1][-1],
+                            allocated_time_dict[constants.PRE_PROCESS_STEP][-1][-1],
+                        )
+                    ]
+                start_mid_process = allocated_time_dict[constants.PROCESSING_STEP][0][0]
+                end_mid_process = allocated_time_dict[constants.PROCESSING_STEP][-1][-1]
+                for gr_time_machine in ts_list_machine:
+                    s_machine = gr_time_machine[0]
+                    e_machine = gr_time_machine[1]
+                    is_mid_process_not_suitable = True
+                    if s_machine <= start_mid_process <= end_mid_process <= e_machine:
+                        is_mid_process_not_suitable = False
+                        break
+                if is_mid_process_not_suitable:
+                    continue
+                end_mid_process = self.shift_end_to_next_holiday(
+                    end_mid_process, process_unit["is_work_break_time"]
+                )
+                allocated_time_dict[constants.PROCESSING_STEP][-1] = (
+                    allocated_time_dict[constants.PROCESSING_STEP][-1][0],
+                    end_mid_process,
+                )
+                time_ranges = ts_list[index]
+                is_post_process_not_suitable = False
+                if not post_processing_time == 0:
+                    while end_mid_process >= time_ranges[-1][-1]:
+                        index += 1
+                        if index > len(ts_list) - 1:
+                            is_post_process_not_suitable = True
+                            break
+                        time_ranges = ts_list[index]
+                    while time_ranges:
+                        start_time, end_time = time_ranges[0]
+                        if end_time <= end_mid_process:
+                            time_ranges.pop(0)
+                        else:
+                            time_ranges[0] = (end_mid_process, end_time)
+                            break
+                    else:
+                        is_post_process_not_suitable = True
+                    if is_post_process_not_suitable:
+                        continue
+                    is_post_process_not_suitable = False
+                    if post_processing_time > 0:
+                        while post_processing_time > 0 and time_ranges:
+                            start_time, end_time = time_ranges[0]
+                            time_difference = end_time - start_time
+
+                            if (
+                                time_difference.total_seconds()
+                                >= post_processing_time * 60
+                            ):
+                                end_post_process = start_time + timedelta(
+                                    minutes=post_processing_time
+                                )
+                                post_processing_time = 0
+                                allocated_time_dict[constants.POST_PROCESS_STEP].append(
+                                    (start_time, end_post_process)
+                                )
+                                if end_post_process == end_time:
+                                    time_ranges.pop(0)
+                                else:
+                                    time_ranges[0] = (end_post_process, end_time)
+                            else:
+                                if len(time_ranges):
+                                    allocated_time_dict[
+                                        constants.POST_PROCESS_STEP
+                                    ].append(time_ranges.pop(0))
+                                    post_processing_time -= (
+                                        time_difference.total_seconds() // 60
+                                    )
+                                    if not len(time_ranges) and post_processing_time:
+                                        is_post_process_not_suitable = True
+                                        break
+                                else:
+                                    is_post_process_not_suitable = True
+                                    break
+                    else:
+                        allocated_time_dict[constants.POST_PROCESS_STEP].append(
+                            (time_ranges[0][0], time_ranges[0][0])
+                        )
+
+                    if is_post_process_not_suitable:
+                        continue
+                else:
+                    if end_mid_process > time_ranges[-1][-1]:
+                        continue
+                    allocated_time_dict[constants.POST_PROCESS_STEP].append(
+                        (end_mid_process, end_mid_process)
+                    )
+                end_process = allocated_time_dict[constants.POST_PROCESS_STEP][-1][-1]
+                # build decision dict
+                decision_dict[f"{id}___{index}"] = {
+                    "end": end_process,
+                    "overtime_hours": (
+                        self.get_overtime_hours(
+                            allocated_time_dict[constants.PRE_PROCESS_STEP][0][0],
+                            end_process,
+                        )
+                        if overtime
+                        else 0
+                    ),
+                    "operating_rate": operating_rate_worker + operating_rate_machine,
+                    "allocated_time_dict": allocated_time_dict,
+                    "is_not_auto": not self.factory_rs_info["dict_machine_auto"].get(
+                        process_id, False
+                    ),
+                    "night_time": self.compute_night_time_hours(
+                        allocated_time_dict[constants.PROCESSING_STEP]
+                    ),
+                }
+        return decision_dict
+
+    def build_allocated_time_list_for_linker(
+        self,
+        process_unit,
+        list_valid_ids,
+        schedule_predict_step_dict,
+        total_allocated_time,
+        overtime,
+        deadline=None,
+    ):
+        decision_dict = {}
+        best_end_process = None
+        dict_operating_rate_worker = {}
+        dict_operating_rate_machine = {}
+        dict_start_of_ids = {}
+        for id in list_valid_ids:
+            dict_start_of_ids[id] = schedule_predict_step_dict[
+                constants.PRE_PROCESS_STEP
+            ][id][0][0][0]
+        for id, start_process in sorted(dict_start_of_ids.items(), key=lambda x: x[1]):
+            allocated_time_dict = defaultdict()
+            current_end = start_process
+            for step, p_time in process_unit["timing_details"].items():
+                if (
+                    process_unit["is_nightshift_expected"]
+                    and step == constants.PROCESSING_STEP
+                ):
+                    if not process_unit["is_work_break_time"]:
+                        allocated_time_list_tmp, _ = (
+                            self.allocate_processing_time_with_breaks(
+                                start=current_end,
+                                processing_minutes=p_time,
+                                deadline=deadline,
+                            )
+                        )
+                    else:
+                        end_mid_process = current_end + timedelta(minutes=p_time)
+                        if deadline and current_end <= deadline <= end_mid_process:
+                            allocated_time_list_tmp = [
+                                (current_end, deadline),
+                                (deadline, end_mid_process),
+                            ]
+                        else:
+                            allocated_time_list_tmp = [(current_end, end_mid_process)]
+                    if process_unit["timing_details"][constants.POST_PROCESS_STEP] > 0:
+                        end_mid_process = self.shift_end_to_next_holiday(
+                            allocated_time_list_tmp[-1][-1],
+                            process_unit["is_work_break_time"],
+                        )
+                        if (
+                            deadline
+                            and allocated_time_list_tmp[-1][0]
+                            <= deadline
+                            <= end_mid_process
+                        ):
+                            allocated_time_list_tmp[-1] = (
+                                allocated_time_list_tmp[-1][0],
+                                deadline,
+                            )
+                            allocated_time_list_tmp.append((deadline, end_mid_process))
+                        else:
+                            allocated_time_list_tmp[-1] = (
+                                allocated_time_list_tmp[-1][0],
+                                end_mid_process,
+                            )
+                else:
+                    allocated_time_list_tmp, _ = self.generate_working_intervals(
+                        start_dt=current_end,
+                        min_total_minutes=p_time,
+                        is_work_break_time=process_unit["is_work_break_time"],
+                    )
+                allocated_time_dict[step] = allocated_time_list_tmp
+                current_end = allocated_time_list_tmp[-1][-1]
+
+            end_process = self.max_end_date_in_dict(allocated_time_dict)
+            if best_end_process is not None and end_process > best_end_process:
+                continue
+            worker_id, machine_id, _ = map(lambda x: int(float(x)), id.split("___"))
+            is_auto = self.factory_rs_info["dict_machine_auto"].get(machine_id, False)
+            operating_rate_worker = dict_operating_rate_worker.setdefault(
+                worker_id,
+                self.get_operating_rate(
+                    rs_id=worker_id,
+                    total_allocated_time=total_allocated_time,
+                    type="worker",
+                ),
+            )
+            operating_rate_machine = dict_operating_rate_machine.setdefault(
+                machine_id,
+                self.get_operating_rate(
+                    rs_id=machine_id,
+                    total_allocated_time=total_allocated_time,
+                    type="machine",
+                ),
+            )
+            decision_dict[f"{id}"] = {
+                "end": self.max_end_date_in_dict(allocated_time_dict),
+                "overtime_hours": (
+                    self.get_overtime_hours(
+                        start_process, end_process, process_unit["is_work_break_time"]
+                    )
+                    if overtime
+                    else 0
+                ),
+                "operating_rate": operating_rate_worker + operating_rate_machine,
+                "is_not_auto": not is_auto,
+                "allocated_time_dict": allocated_time_dict,
+            }
+            best_end_process = end_process
+        return decision_dict
+
+    def schedule_core_linker(
+        self,
+        process_unit,
+        decision_dict_child,
+        factory_resources,
+        deadline,
+        overtime=False,
+        night_time_prioritize=False,
+        keep_deadline=True,
+        time_grouper_machine=None,
+        force_start=None,
+    ):
+        for k, t_range in factory_resources.items():
+            temp_time_dict = []
+            for s, e in t_range:
+                temp_time_dict.append(
+                    (
+                        max(
+                            s,
+                            s.replace(
+                                hour=self.WORKING_HOURS_START.hour,
+                                minute=self.WORKING_HOURS_START.minute,
+                            ),
+                        ),
+                        min(
+                            e,
+                            e.replace(
+                                hour=self.WORKING_HOURS_END.hour,
+                                minute=self.WORKING_HOURS_END.minute,
+                            ),
+                        ),
+                    )
+                )
+            factory_resources[k] = temp_time_dict
+        time_grouper = self.avail_time_grouper(
+            factory_resources, process_unit["is_work_break_time"]
+        )
+        total_allocated_time_in_period = self.get_diff_hours(
+            self.dt_current_date,
+            deadline,
+            is_work_break_time=process_unit["is_work_break_time"],
+        )
+        if keep_deadline and not time_grouper:
+            return {}
+        if decision_dict_child:
+            dict_force_start = {}
+            if force_start:
+                for id, ts_list in time_grouper.items():
+                    dict_force_start[f"{id}___0"] = force_start
+            else:
+                for id, value in decision_dict_child.items():
+                    dict_force_start[id] = self.max_end_date_in_dict(
+                        value["allocated_time_dict"]
+                    )
+                    for id_new, ts_list in time_grouper.items():
+                        dict_force_start[f"{id_new}___0"] = self.max_end_date_in_dict(
+                            value["allocated_time_dict"]
+                        )
+            list_valid_ids, schedule_predict_step_dict = self.resource_filter_linker(
+                process_unit=process_unit,
+                dict_force_start=dict_force_start,
+                time_grouper=time_grouper,
+                time_grouper_machine=time_grouper_machine,
+                deadline=deadline,
+            )
+        else:
+            list_valid_ids, schedule_predict_step_dict = self.resource_filter(
+                process_unit=process_unit,
+                time_grouper=time_grouper,
+                time_grouper_machine=time_grouper_machine,
+                deadline=deadline,
+            )
+        if night_time_prioritize or False:
+            decision_dict_tmp = (
+                self.build_enough_time_list_unmanned_process_nightshift_priority_linker(
+                    process_unit=process_unit,
+                    total_allocated_time=total_allocated_time_in_period,
+                    overtime=overtime,
+                )
+            )
+        else:
+            decision_dict_tmp = self.build_allocated_time_list_for_linker(
+                process_unit=process_unit,
+                list_valid_ids=list_valid_ids,
+                schedule_predict_step_dict=schedule_predict_step_dict,
+                total_allocated_time=total_allocated_time_in_period,
+                overtime=overtime,
+                deadline=None if keep_deadline else deadline,
+            )
+        return decision_dict_tmp
+
+    def extract_start_end(self, process_info):
+        alloc = process_info["allocated_time_dict"]
+        start = alloc["pre_processing"][0][0]
+        end = alloc["post_processing"][-1][1]
+        return start, end
+
+    def build_chains(self, process_dict):
+        intervals = {
+            pid: self.extract_start_end(info) for pid, info in process_dict.items()
+        }
+        chains = []
+        used = set()
+        for pid, (s, e) in intervals.items():
+            if pid in used:
+                continue
+            chain = [pid]
+            used.add(pid)
+            while True:
+                found = False
+                for nxt, (s2, e2) in intervals.items():
+                    if nxt not in used and self.are_shifts_connected(e, s2):
+                        chain.append(nxt)
+                        used.add(nxt)
+                        e = e2
+                        found = True
+                        break
+                if not found:
+                    break
+            chains.append(chain)
+        return chains
+
+
 if __name__ == "__main__":
 
     time_computer = TimeComputation(
