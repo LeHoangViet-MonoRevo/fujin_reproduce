@@ -8,7 +8,7 @@ import pandas as pd
 import polars as pl
 from google.protobuf.json_format import ParseDict
 
-import constants
+from constants import constants
 
 warnings.simplefilter(action="ignore", category=Warning)
 
