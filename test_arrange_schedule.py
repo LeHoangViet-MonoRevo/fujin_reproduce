@@ -41,7 +41,7 @@ process_list = [
         "linker_id": None,
         "final_deadline": "2025-10-02 17:00:00",
         "material_deadline": "",
-        "product_shape": {"shape": "A"},
+        "product_shape": {"shape": "A", "dimension": "10x20x30"},
         "status": 1,
         "actual_start_at": None,
     },
@@ -66,7 +66,7 @@ process_list = [
         "linker_id": None,
         "final_deadline": "2025-10-02 17:00:00",
         "material_deadline": "",
-        "product_shape": {"shape": "A"},
+        "product_shape": {"shape": "A", "dimension": "17x29x58"},
         "status": 1,
         "actual_start_at": None,
     },
@@ -83,6 +83,11 @@ factory_rs_info = {
     "dict_worker_group_to_worker": {"group_a": [1]},
     "dict_machine_auto": {101: False, 102: False},
     "list_machine_active": [101, 102],
+    # NEW: Add machine dimension capabilities here
+    "dict_machine_dimensions": {
+        101: (50, 50, 50),  # Machine 101 can handle up to 50x50x50
+        102: (17, 29, 58),  # Machine 102 can handle up to 100x100x100
+    },
 }
 
 # --- DataFrames with existing schedules ---

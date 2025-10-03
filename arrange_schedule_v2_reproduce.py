@@ -110,6 +110,25 @@ class ArrangeScheduleService(TimeComputationExtention):
                             )
                         )
                     )
+
+                    # <<< START of new code to filter by dimension
+                    product_dim_str = process_unit.get("product_shape", {}).get(
+                        "dimension"
+                    )
+                    machine_dimensions = self.factory_rs_info.get(
+                        "dict_machine_dimensions", {}
+                    )
+
+                    # Filter the machine list based on dimension compatibility
+                    list_machine = [
+                        machine_id
+                        for machine_id in list_machine
+                        if self._can_machine_handle_dimensions(
+                            product_dim_str, machine_dimensions.get(machine_id)
+                        )
+                    ]
+                    # <<< END of new code
+
                     list_worker_by_group = self.factory_rs_info[
                         "dict_worker_group_to_worker"
                     ].get(process_unit["worker_group"], list_total_worker)
@@ -701,6 +720,41 @@ class ArrangeScheduleService(TimeComputationExtention):
         #         routing_key="request_id"
         #     )
         pass
+
+    def _can_machine_handle_dimensions(
+        self, product_dim_str: str, machine_dim_tuple: tuple
+    ) -> bool:
+        """
+        Checks if a machine's dimensions can handle a product's dimensions.
+        """
+
+        # If the machine has no dimension limits, assume it fits.
+        if not machine_dim_tuple:
+            return True
+
+        # If the product has no dimensions specified, assume it fits
+        if not product_dim_str:
+            return True
+
+        try:
+            # Parse the product dimension string "L x W x H" into a sorted list of numbers
+            product_dims = sorted([float(d) for d in product_dim_str.split("x")])
+
+            # Sort the machine's dimension tuple
+            machine_dims = sorted(machine_dim_tuple)
+
+            # Ensure the lists have the same length to compare
+            if len(product_dims) != len(machine_dims):
+                return False  # Or handle 2D vs 3D comparison differently
+
+            # Check if each product dimension is less than or equal to the corresponding machine dimension
+            return all(
+                p_dim <= m_dim for p_dim, m_dim in zip(product_dims, machine_dims)
+            )
+
+        except (ValueError, TypeError):
+            # If parsing fails, default to assuming it doesn't fit to be safe.
+            return False
 
     def build_schedule(
         self,
